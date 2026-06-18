@@ -1,0 +1,18 @@
+# credentials
+service_account.json
+*.json.key
+.env
+
+# generated
+chroma_db/
+uploads/
+__pycache__/
+*.pyc
+*.pyo
+.idea/
+.vscode/
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
