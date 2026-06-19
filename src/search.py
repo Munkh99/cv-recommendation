@@ -9,6 +9,7 @@ Langfuse LangChain callback inside the agent/LLM calls.
 """
 
 import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from src.schema import SECTIONS, CVExtract, CandidateResult, SearchRequest, SearchResponse
 from src.config import get_settings
@@ -120,20 +121,27 @@ def search(req: SearchRequest) -> SearchResponse:
     top = ranked[: req.top_k]
 
     why_query = _why_query(req.query, filters)
-    candidates = []
-    for overall, cid, meta, scores in top:
+
+    def _why_task(item):
+        overall, cid, meta, scores = item
         extract = CVExtract.model_validate_json(meta["extract_json"])
-        wr = generate_why(why_query, extract, scores)  # rationale + filter assessment
-        candidates.append(
-            CandidateResult(
-                candidate_id=cid,
-                name=meta.get("name", cid),
-                role_title=meta.get("role_title", ""),
-                overall=overall,
-                scores=scores,
-                why=wr.why,
-                filters=wr.filters,
-            )
+        wr = generate_why(why_query, extract, scores)
+        return CandidateResult(
+            candidate_id=cid,
+            name=meta.get("name", cid),
+            role_title=meta.get("role_title", ""),
+            overall=overall,
+            scores=scores,
+            why=wr.why,
+            filters=wr.filters,
         )
+
+    results: dict[int, CandidateResult] = {}
+    with ThreadPoolExecutor(max_workers=len(top) or 1) as pool:
+        futures = {pool.submit(_why_task, item): i for i, item in enumerate(top)}
+        for fut in as_completed(futures):
+            results[futures[fut]] = fut.result()
+
+    candidates = [results[i] for i in range(len(top))]
 
     return SearchResponse(query=req.query, filters=filters, candidates=candidates)

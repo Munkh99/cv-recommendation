@@ -4,6 +4,7 @@ Decomposes a messy free-text query into per-section sub-queries and calls the se
 search tools. Returns the per-section score matrix for deterministic blending in
 src/search.py. Traced via the Langfuse LangChain callback."""
 
+from functools import lru_cache
 from pathlib import Path
 
 from langchain.agents import create_agent
@@ -18,11 +19,12 @@ from src.agent.tools import TOOLS
 _PROMPT = (Path(__file__).resolve().parent / "prompt.txt").read_text(encoding="utf-8")
 
 
-def build_agent_model():
-    # Pass our configured Vertex client (credentials/labels/thinking_level), not a
-    # "google_genai:..." string — the string form would bypass all of that.
+@lru_cache(maxsize=1)
+def _agent():
+    """Singleton compiled agent — stateless, safe to reuse across requests."""
     s = get_settings()
-    return build_google_genai_llm(model=s.GEMINI_MODEL)
+    model = build_google_genai_llm(model=s.GEMINI_MODEL, thinking_level=s.THINKING_LEVEL)
+    return create_agent(model=model, tools=TOOLS, system_prompt=_PROMPT, response_format=PlannerOutput)
 
 
 def agentic_retrieve(query: str) -> tuple[dict, set, dict]:
@@ -34,12 +36,7 @@ def agentic_retrieve(query: str) -> tuple[dict, set, dict]:
       filters = {location, min_years, language, availability} — extracted from query,
                 values are None when the query didn't mention that constraint
     """
-    agent = create_agent(
-        model=build_agent_model(),
-        tools=TOOLS,
-        system_prompt=_PROMPT,
-        response_format=PlannerOutput,
-    )
+    agent = _agent()
 
     result = agent.invoke(
         {"messages": [{"role": "user", "content": query}]},
