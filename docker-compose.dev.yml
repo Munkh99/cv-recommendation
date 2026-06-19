@@ -1,0 +1,51 @@
+# Development compose: FastAPI backend + Streamlit query-engine UI.
+# Usage:  docker compose -f docker-compose.dev.yml up --build
+# Then:   UI  -> http://localhost:8501   API docs -> http://localhost:8000/docs
+services:
+  api:
+    build: .
+    command:
+      - uvicorn
+      - api.main:app
+      - --host=0.0.0.0
+      - --port=8000
+      - --reload
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    volumes:
+      - ./api:/app/api          # live reload
+      - ./src:/app/src
+      - ./data:/app/data        # CV source PDFs for ingestion
+      - ./chroma_db:/app/chroma_db   # persisted vector index
+      - ./key.json:/app/key.json:ro  # GCP service account (create before `up`)
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  ui:
+    build: .
+    command:
+      - streamlit
+      - run
+      - app.py
+      - --server.port=8501
+      - --server.address=0.0.0.0
+      - --server.runOnSave=true
+      - --server.fileWatcherType=poll
+    ports:
+      - "8501:8501"
+    env_file:
+      - .env
+    environment:
+      # Reach the backend by compose service name, not localhost.
+      - API_BASE_URL=http://api:8000
+    volumes:
+      - ./app.py:/app/app.py
+      - ./src:/app/src
+    depends_on:
+      - api

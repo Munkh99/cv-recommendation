@@ -1,5 +1,6 @@
 # credentials
 service_account.json
+key.json
 *.json.key
 .env
 
@@ -16,3 +17,4 @@ dist/
 build/
 .venv/
 venv/
+.claude

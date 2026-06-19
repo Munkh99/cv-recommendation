@@ -1,30 +1,33 @@
-import vertexai
-from vertexai.language_models import TextEmbeddingModel, TextEmbeddingInput
-from google.oauth2 import service_account
+"""Embeddings via the LangChain wrapper (GoogleGenerativeAIEmbeddings on Vertex AI).
 
-_SCOPES = ["https://www.googleapis.com/auth/cloud-platform"]
-_EMBEDDING_MODEL = "text-embedding-004"
+Separate client from the chat LLM. embed_query uses RETRIEVAL_QUERY and embed_documents
+uses RETRIEVAL_DOCUMENT task types automatically; dimensionality comes from config."""
+
+from functools import lru_cache
+
+from langchain_google_genai import GoogleGenerativeAIEmbeddings
+
+from src.config import get_settings
+from src.llm import build_credentials
 
 
-def get_embedding_client(service_account_path: str, project_id: str, location: str = "us-central1") -> TextEmbeddingModel:
-    credentials = service_account.Credentials.from_service_account_file(
-        service_account_path, scopes=_SCOPES
+@lru_cache(maxsize=1)
+def get_embedder() -> GoogleGenerativeAIEmbeddings:
+    s = get_settings()
+    return GoogleGenerativeAIEmbeddings(
+        model=s.EMBEDDING_MODEL,
+        vertexai=True,
+        project=s.GOOGLE_CLOUD_PROJECT,
+        location=s.GEMINI_LOCATION,
+        credentials=build_credentials(),
+        output_dimensionality=s.EMBEDDING_DIMENSIONS,
     )
-    vertexai.init(project=project_id, location=location, credentials=credentials)
-    return TextEmbeddingModel.from_pretrained(_EMBEDDING_MODEL)
 
 
-def embed_texts(model: TextEmbeddingModel, texts: list[str], batch_size: int = 20) -> list[list[float]]:
-    all_embeddings = []
-    for i in range(0, len(texts), batch_size):
-        batch = texts[i : i + batch_size]
-        inputs = [TextEmbeddingInput(t, "RETRIEVAL_DOCUMENT") for t in batch]
-        results = model.get_embeddings(inputs)
-        all_embeddings.extend(e.values for e in results)
-    return all_embeddings
+def embed_query(text: str) -> list[float]:
+    return get_embedder().embed_query(text)
 
 
-def embed_query(model: TextEmbeddingModel, query: str) -> list[float]:
-    inputs = [TextEmbeddingInput(query, "RETRIEVAL_QUERY")]
-    results = model.get_embeddings(inputs)
-    return results[0].values
+def embed_texts(texts: list[str]) -> list[list[float]]:
+    embedder = get_embedder()
+    return [embedder.embed_documents([t])[0] for t in texts]

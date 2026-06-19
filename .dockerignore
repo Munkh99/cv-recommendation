@@ -1,0 +1,26 @@
+# secrets — never bake into the image (mounted at runtime instead)
+.env
+key.json
+service_account.json
+*.json.key
+
+# generated / large — provided via volume mounts
+chroma_db/
+uploads/
+data/
+
+# python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+venv/
+
+# vcs / editor / build
+.git/
+.gitignore
+.idea/
+.vscode/
+dist/
+build/

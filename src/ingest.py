@@ -1,89 +1,95 @@
+"""Ingest CVs as four embedded sections per candidate, with filter metadata.
+
+Layout in ChromaDB: one record per (candidate, section). Each record's document is that
+section's text; its embedding is that section's vector. The full extracted CV is
+duplicated as JSON on every record so search can rebuild it without extra fetches.
+"""
+
 import os
-import hashlib
 import argparse
+
 import fitz  # pymupdf
-import chromadb
-from src.embeddings import get_embedding_client, embed_texts
+
+from src.schema import SECTIONS, CVExtract
+from src.vectorstore import VectorStore
+from src.llm import extract_cv
+from src.embeddings import embed_texts
 
 
-def load_pdf(path: str) -> list[dict]:
+def load_pdf_text(path: str) -> str:
     doc = fitz.open(path)
-    pages = []
-    for i, page in enumerate(doc):
-        text = page.get_text().strip()
-        if text:
-            pages.append({"text": text, "page": i + 1, "source": os.path.basename(path)})
+    text = "\n".join(page.get_text().strip() for page in doc)
     doc.close()
-    return pages
+    return text.strip()
 
 
-def chunk_text(text: str, chunk_size: int = 500, overlap: int = 50) -> list[str]:
-    chunks, start = [], 0
-    while start < len(text):
-        chunks.append(text[start : start + chunk_size])
-        start += chunk_size - overlap
-    return [c for c in chunks if c.strip()]
+def _candidate_id(path: str) -> str:
+    return os.path.splitext(os.path.basename(path))[0]
 
 
-def _chunk_id(source: str, index: int, text: str) -> str:
-    digest = hashlib.md5(text.encode()).hexdigest()[:8]
-    return f"{source}_{index}_{digest}"
+def _scalar_metadata(extract: CVExtract) -> dict:
+    """Chroma metadata must be scalar — flatten lists/None to filterable values."""
+    return {
+        "name": extract.name,
+        "role_title": extract.role_title,
+        "location": extract.location or "",
+        # -1 = unknown; search treats it as "not stated", not "0 years".
+        "years_experience": extract.years_experience if extract.years_experience is not None else -1.0,
+        "languages": ",".join(extract.languages).lower(),
+        "availability": extract.availability or "",
+        "extract_json": extract.model_dump_json(),
+    }
 
 
-def ingest_pdf(
-    pdf_path: str,
-    collection: chromadb.Collection,
-    embedding_model,
-    chunk_size: int = 500,
-    overlap: int = 50,
-) -> int:
-    pages = load_pdf(pdf_path)
-    chunks, metadatas, ids = [], [], []
-
-    for page in pages:
-        for chunk in chunk_text(page["text"], chunk_size, overlap):
-            idx = len(chunks)
-            chunks.append(chunk)
-            metadatas.append({"source": page["source"], "page": page["page"]})
-            ids.append(_chunk_id(page["source"], idx, chunk))
-
-    if not chunks:
+def ingest_pdf(pdf_path: str, store: VectorStore) -> str:
+    """Extract one CV, embed its four sections, upsert into the store."""
+    cid = _candidate_id(pdf_path)
+    raw = load_pdf_text(pdf_path)
+    if not raw:
         print(f"[warn] No text extracted from {pdf_path}")
-        return 0
+        return cid
 
-    embeddings = embed_texts(embedding_model, chunks)
-    collection.add(documents=chunks, embeddings=embeddings, metadatas=metadatas, ids=ids)
-    print(f"Ingested {len(chunks)} chunks from {os.path.basename(pdf_path)}")
-    return len(chunks)
+    extract = extract_cv(raw)
+    base_meta = _scalar_metadata(extract)
 
+    section_texts = [extract.section_text(s) for s in SECTIONS]
+    embeddings = embed_texts(section_texts)
 
-def get_collection(db_path: str = "./chroma_db", collection_name: str = "documents") -> chromadb.Collection:
-    client = chromadb.PersistentClient(path=db_path)
-    return client.get_or_create_collection(name=collection_name, metadata={"hnsw:space": "cosine"})
+    ids, docs, metas, embs = [], [], [], []
+    for section, text, emb in zip(SECTIONS, section_texts, embeddings):
+        ids.append(f"{cid}::{section}")
+        docs.append(text)
+        metas.append({**base_meta, "candidate_id": cid, "section": section})
+        embs.append(emb)
+
+    store.upsert(ids=ids, documents=docs, metadatas=metas, embeddings=embs)
+    print(f"Ingested {extract.name} ({cid}) — {len(SECTIONS)} sections")
+    return cid
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Ingest PDF files into ChromaDB")
-    parser.add_argument("--pdf", required=True, help="PDF file or directory of PDFs")
-    parser.add_argument("--sa", default="service_account.json", help="Service account JSON path")
-    parser.add_argument("--project", required=True, help="GCP project ID")
-    parser.add_argument("--location", default="us-central1")
-    parser.add_argument("--collection", default="documents")
-    parser.add_argument("--db-path", default="./chroma_db")
-    parser.add_argument("--chunk-size", type=int, default=500)
-    parser.add_argument("--overlap", type=int, default=50)
+    parser = argparse.ArgumentParser(description="Ingest CV PDFs into ChromaDB")
+    parser.add_argument("--pdf", default="data/raw", help="PDF file or directory")
+    parser.add_argument("--db-path", default=None)
+    parser.add_argument("--collection", default=None)
+    parser.add_argument("--limit", type=int, default=None, help="Max PDFs to ingest")
     args = parser.parse_args()
 
-    model = get_embedding_client(args.sa, args.project, args.location)
-    collection = get_collection(args.db_path, args.collection)
+    store = VectorStore(args.db_path, args.collection)
 
     if os.path.isdir(args.pdf):
-        pdf_files = [os.path.join(args.pdf, f) for f in os.listdir(args.pdf) if f.lower().endswith(".pdf")]
+        pdfs = [
+            os.path.join(args.pdf, f)
+            for f in sorted(os.listdir(args.pdf))
+            if f.lower().endswith(".pdf")
+        ]
     else:
-        pdf_files = [args.pdf]
+        pdfs = [args.pdf]
 
-    total = 0
-    for pdf in pdf_files:
-        total += ingest_pdf(pdf, collection, model, args.chunk_size, args.overlap)
+    if args.limit:
+        pdfs = pdfs[: args.limit]
 
-    print(f"\nDone — {total} total chunks stored in '{args.collection}'")
+    for pdf in pdfs:
+        ingest_pdf(pdf, store)
+
+    print(f"\nDone — {len(pdfs)} CV(s) ingested")
